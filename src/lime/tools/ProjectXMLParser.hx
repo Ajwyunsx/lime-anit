@@ -22,6 +22,8 @@ class ProjectXMLParser extends HXProject
 {
 	public var includePaths:Array<String>;
 	private var reuseAndroidAssetsSkipLogged:Bool = false;
+	private var reusableAndroidOutputCache:Null<Bool> = null;
+	private var projectRootForReuse:String = "";
 
 	private static var doubleVarMatch = new EReg("\\$\\${(.*?)}", "");
 	private static var varMatch = new EReg("\\${(.*?)}", "");
@@ -786,20 +788,92 @@ class ProjectXMLParser extends HXProject
 
 	private function hasReusableAndroidOutput():Bool
 	{
-		var androidOutput = Path.combine(Sys.getCwd(), "export/release/android");
+		if (reusableAndroidOutputCache != null)
+			return reusableAndroidOutputCache;
+
+		var androidOutput = resolveAndroidOutputForReuse();
 		var assetsDirectory = Path.combine(androidOutput, "bin/app/src/main/assets");
 		var haxeDirectory = Path.combine(androidOutput, "haxe");
 
 		if (!FileSystem.exists(assetsDirectory) || !FileSystem.isDirectory(assetsDirectory))
-			return false;
+			return reusableAndroidOutputCache = false;
 
 		if (!FileSystem.exists(haxeDirectory) || !FileSystem.isDirectory(haxeDirectory))
-			return false;
+			return reusableAndroidOutputCache = false;
+
+		if (cachedAndroidOutputNeedsKTXRefresh(androidOutput, assetsDirectory, haxeDirectory))
+			return reusableAndroidOutputCache = false;
 
 		for (entry in FileSystem.readDirectory(haxeDirectory))
 		{
 			if (Path.extension(entry).toLowerCase() == "hxml")
+				return reusableAndroidOutputCache = true;
+		}
+
+		return reusableAndroidOutputCache = false;
+	}
+
+	private function cachedAndroidOutputNeedsKTXRefresh(androidOutput:String, assetsDirectory:String, haxeDirectory:String):Bool
+	{
+		if (containsFileEnding(assetsDirectory, ".astc"))
+			return true;
+
+		if (containsFileEnding(assetsDirectory, ".astc.ktx"))
+			return false;
+
+		var manifestResources = Path.combine(haxeDirectory, "ManifestResources.hx");
+		if (FileSystem.exists(manifestResources))
+		{
+			var content = File.getContent(manifestResources);
+			if (content.indexOf(".astc") != -1 && content.indexOf(".astc.ktx") == -1)
 				return true;
+		}
+
+		return false;
+	}
+
+	private function resolveAndroidOutputForReuse():String
+	{
+		var outputDirectory = config.getString("android.output-directory", "android");
+		var candidates:Array<String> = [];
+
+		if (projectRootForReuse != null && projectRootForReuse != "")
+		{
+			candidates.push(Path.combine(projectRootForReuse, "export/release/" + outputDirectory));
+			candidates.push(Path.combine(projectRootForReuse, "export/debug/" + outputDirectory));
+			candidates.push(Path.combine(projectRootForReuse, "export/final/" + outputDirectory));
+			candidates.push(Path.combine(projectRootForReuse, outputDirectory));
+		}
+
+		candidates.push(Path.combine(Sys.getCwd(), "export/release/" + outputDirectory));
+		candidates.push(Path.combine(Sys.getCwd(), outputDirectory));
+
+		for (candidate in candidates)
+		{
+			if (candidate != null && candidate != "" && FileSystem.exists(candidate) && FileSystem.isDirectory(candidate))
+				return Path.standardize(candidate);
+		}
+
+		return candidates.length > 0 ? Path.standardize(candidates[0]) : Path.combine(Sys.getCwd(), "export/release/android");
+	}
+
+	private function containsFileEnding(directory:String, ending:String):Bool
+	{
+		if (directory == null || directory == "" || !FileSystem.exists(directory) || !FileSystem.isDirectory(directory))
+			return false;
+
+		for (entry in FileSystem.readDirectory(directory))
+		{
+			var path = Path.combine(directory, entry);
+			if (FileSystem.isDirectory(path))
+			{
+				if (containsFileEnding(path, ending))
+					return true;
+			}
+			else if (StringTools.endsWith(Path.standardize(path).toLowerCase(), ending))
+			{
+				return true;
+			}
 		}
 
 		return false;
@@ -2294,6 +2368,8 @@ class ProjectXMLParser extends HXProject
 		{
 			xml = new Access(Xml.parse(File.getContent(projectFile)).firstElement());
 			extensionPath = Path.directory(projectFile);
+			projectFilePath = FileSystem.fullPath(projectFile);
+			projectRootForReuse = Path.directory(projectFilePath);
 		}
 		catch (e:Dynamic)
 		{

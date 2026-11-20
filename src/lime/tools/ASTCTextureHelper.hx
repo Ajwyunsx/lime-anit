@@ -4,6 +4,7 @@ import hxp.Haxelib;
 import hxp.Log;
 import hxp.Path;
 import hxp.System;
+import haxe.io.Bytes;
 import lime.graphics.Image;
 import lime.graphics.ImageFileFormat;
 import lime.graphics.PixelFormat;
@@ -14,6 +15,11 @@ import sys.FileSystem;
 
 class ASTCTextureHelper
 {
+	private static inline var RAW_ASTC_EXTENSION:String = "astc";
+	private static inline var KTX_ASTC_EXTENSION:String = "astc.ktx";
+	private static inline var KTX_HEADER_SIZE:Int = 64;
+	private static inline var ASTC_HEADER_SIZE:Int = 16;
+
 	private static var checkedEncoder:Bool = false;
 	private static var encoderPath:String = null;
 	private static var compressorAvailable:Null<Bool> = null;
@@ -23,6 +29,7 @@ class ASTCTextureHelper
 	private static var failed:Int = 0;
 	private static var strippedPNG:Int = 0;
 	private static var strippedPNGAssets:Array<Asset> = [];
+	private static var readablePNGAssets:Array<Asset> = [];
 
 	public static function prepareProjectAssets(project:HXProject, targetDirectory:String):Void
 	{
@@ -31,6 +38,7 @@ class ASTCTextureHelper
 		failed = 0;
 		strippedPNG = 0;
 		strippedPNGAssets = [];
+		readablePNGAssets = [];
 
 		if (!isEnabled(project))
 			return;
@@ -40,6 +48,7 @@ class ASTCTextureHelper
 			+ " premultiplyAlpha=" + getPremultiplyAlpha(project)
 			+ " smartBlocks=" + getSmartBlocks(project) + " detailBlock=" + getDetailBlockSize(project)
 			+ " largeBlock=" + getLargeBlockSize(project) + " hugeBlock=" + getHugeBlockSize(project)
+			+ " container=" + getTextureExtension(project)
 			+ " strict=" + getStrict(project));
 
 		if (!hasEncoder())
@@ -74,9 +83,38 @@ class ASTCTextureHelper
 				continue;
 			}
 
-			var resourceName = replaceExtension(asset.resourceName, "astc");
+			if (shouldKeepReadablePNG(asset))
+			{
+				rememberReadablePNG(asset);
+				finalAssets.push(asset);
+				continue;
+			}
+
+			var textureExtension = getTextureExtension(project);
+			var resourceName = replaceExtension(asset.resourceName, textureExtension);
+			var output = Path.combine(astcCache, resourceName);
 			if (existing.exists(resourceName))
 			{
+				var hasCompressedOutput = FileSystem.exists(output) || tryCompressPNG(project, asset.sourcePath, output);
+				if (hasCompressedOutput)
+				{
+					var cachedAsset = asset.clone();
+					cachedAsset.sourcePath = output;
+					cachedAsset.resourceName = resourceName;
+					cachedAsset.targetPath = replaceExtension(asset.targetPath, textureExtension);
+					cachedAsset.id = cachedAsset.targetPath;
+					cachedAsset.flatName = replaceExtension(asset.flatName, textureExtension);
+					cachedAsset.format = usesKTXContainer(project) ? "ktx" : RAW_ASTC_EXTENSION;
+					cachedAsset.type = BINARY;
+					cachedAsset.embed = false;
+					cachedAsset.encrypt = false;
+					finalAssets.push(cachedAsset);
+				}
+				else if (strict)
+				{
+					Log.error("ASTC strict mode failed to convert duplicate PNG asset: " + asset.sourcePath + ". PNG fallback is disabled.");
+				}
+
 				if (stripPNG)
 					rememberStrippedPNG(asset);
 				else
@@ -84,16 +122,15 @@ class ASTCTextureHelper
 				continue;
 			}
 
-			var output = Path.combine(astcCache, resourceName);
-			if (compressPNG(project, asset.sourcePath, output))
+			if (tryCompressPNG(project, asset.sourcePath, output))
 			{
 				var astcAsset = asset.clone();
 				astcAsset.sourcePath = output;
 				astcAsset.resourceName = resourceName;
-				astcAsset.targetPath = replaceExtension(asset.targetPath, "astc");
+				astcAsset.targetPath = replaceExtension(asset.targetPath, textureExtension);
 				astcAsset.id = astcAsset.targetPath;
-				astcAsset.flatName = replaceExtension(asset.flatName, "astc");
-				astcAsset.format = "astc";
+				astcAsset.flatName = replaceExtension(asset.flatName, textureExtension);
+				astcAsset.format = usesKTXContainer(project) ? "ktx" : RAW_ASTC_EXTENSION;
 				astcAsset.type = BINARY;
 				astcAsset.embed = false;
 				astcAsset.encrypt = false;
@@ -121,11 +158,47 @@ class ASTCTextureHelper
 		return strippedPNGAssets;
 	}
 
+	public static function getReadablePNGAssets():Array<Asset>
+	{
+		return readablePNGAssets;
+	}
+
 	private static function rememberStrippedPNG(asset:Asset):Void
 	{
 		strippedPNG++;
 		if (asset != null)
 			strippedPNGAssets.push(asset.clone());
+	}
+
+	private static function rememberReadablePNG(asset:Asset):Void
+	{
+		if (asset != null)
+			readablePNGAssets.push(asset.clone());
+	}
+
+	private static function shouldKeepReadablePNG(asset:Asset):Bool
+	{
+		return false;
+	}
+
+	private static function shouldKeepReadablePNGPath(value:String):Bool
+	{
+		if (value == null || value == "")
+			return false;
+
+		var path = normalize(value).toLowerCase();
+		if (!StringTools.startsWith(path, "/"))
+			path = "/" + path;
+
+		return StringTools.endsWith(path, "/images/menus/alphabet.png")
+			|| StringTools.endsWith(path, "/images/menus/alphabet-bold.png")
+			|| StringTools.endsWith(path, "/images/alphabet.png")
+			|| StringTools.endsWith(path, "/images/alphabet-bold.png")
+			|| path.indexOf("/images/alphabet/") != -1
+			|| path.indexOf("/images/menus/options/") != -1
+			|| path.indexOf("/images/game/notes/") != -1
+			|| path.indexOf("/images/stages/") != -1 && path.indexOf("/ui/arrows") != -1
+			|| path.indexOf("/images/tmk/arrows/") != -1;
 	}
 
 	public static function finish(project:HXProject):Void
@@ -142,7 +215,7 @@ class ASTCTextureHelper
 		if (!isEnabled(project) || !isPNGAsset(asset, destination))
 			return;
 
-		var output = Path.withoutExtension(destination) + ".astc";
+		var output = replaceExtension(destination, getTextureExtension(project));
 		compressPNG(project, destination, output);
 	}
 
@@ -158,6 +231,11 @@ class ASTCTextureHelper
 			return true;
 		}
 
+		var finalOutput = output;
+		var rawOutput = getRawASTCOutput(output);
+		if (tryReuseRawASTCAsKTX(project, input, rawOutput, finalOutput))
+			return true;
+
 		var info = analyzeInput(input);
 		var blockSize = getEffectiveBlockSize(project, input, info);
 		var meta = getMeta(project, input, blockSize);
@@ -169,31 +247,52 @@ class ASTCTextureHelper
 			&& (existingMeta == meta || existingMeta == legacyMeta))
 		{
 			cleanupPreparedInput(output + ".premul.png", input);
-			File.saveContent(getMetaPath(output), meta);
+			saveMeta(getMetaPath(output), meta);
 			skipped++;
 			return true;
 		}
 
-		System.mkdir(Path.directory(output));
+		var canReuseRawOutput = finalOutput != rawOutput
+			&& FileSystem.exists(rawOutput)
+			&& !System.isNewer(input, rawOutput)
+			&& isReusableRawASTC(rawOutput);
+
+		System.mkdir(Path.directory(finalOutput));
+		System.mkdir(Path.directory(rawOutput));
 		if (FileSystem.exists(output))
 			FileSystem.deleteFile(output);
 		if (FileSystem.exists(getMetaPath(output)))
 			FileSystem.deleteFile(getMetaPath(output));
+		if (finalOutput != rawOutput && FileSystem.exists(rawOutput) && !canReuseRawOutput)
+			FileSystem.deleteFile(rawOutput);
 
 		var ok = false;
-		var encoder = getDirectEncoder();
-		var source = prepareInputPNG(project, input, output);
-		if (encoder != null && encoder != "")
-			ok = compressWithAstcenc(project, encoder, source, output, blockSize);
-		else
-			ok = compressWithAstcCompressor(project, source, output, blockSize);
-		cleanupPreparedInput(source, input);
-
-		if (ok && FileSystem.exists(output))
+		if (canReuseRawOutput)
 		{
-			File.saveContent(getMetaPath(output), meta);
+			ok = true;
+		}
+		else
+		{
+			var encoder = getDirectEncoder();
+			var source = prepareInputPNG(project, input, finalOutput);
+			if (FileSystem.exists(rawOutput) && !System.isNewer(input, rawOutput))
+				ok = true;
+			else if (encoder != null && encoder != "")
+				ok = compressWithAstcenc(project, encoder, source, rawOutput, blockSize);
+			else
+				ok = compressWithAstcCompressor(project, source, rawOutput, blockSize);
+			cleanupPreparedInput(source, input);
+		}
+
+		if (ok && finalOutput != rawOutput)
+			ok = wrapASTCAsKTX(rawOutput, finalOutput);
+
+		if (ok && FileSystem.exists(finalOutput))
+		{
+			saveMeta(getMetaPath(finalOutput), meta);
 			converted++;
-			Log.info("", " - \x1b[1mWriting ASTC texture:\x1b[0m " + output + " block=" + blockSize);
+			Log.info("", " - \x1b[1mWriting ASTC texture:\x1b[0m " + finalOutput + " block=" + blockSize
+				+ (finalOutput != rawOutput ? " container=ktx" : ""));
 			return true;
 		}
 		else
@@ -207,6 +306,29 @@ class ASTCTextureHelper
 	private static function isEnabled(project:HXProject):Bool
 	{
 		return project != null && project.config.getBool("android.astc-textures", true);
+	}
+
+	private static function usesKTXContainer(project:HXProject):Bool
+	{
+		return project != null && project.config.getBool("android.astc-ktx", true);
+	}
+
+	private static function getTextureExtension(project:HXProject):String
+	{
+		return usesKTXContainer(project) ? KTX_ASTC_EXTENSION : RAW_ASTC_EXTENSION;
+	}
+
+	private static function getRawASTCOutput(output:String):String
+	{
+		if (output == null || output == "")
+			return output;
+
+		var lower = normalize(output).toLowerCase();
+		if (StringTools.endsWith(lower, "." + KTX_ASTC_EXTENSION))
+			return output.substr(0, output.length - ".ktx".length);
+		if (StringTools.endsWith(lower, ".ktx"))
+			return Path.withoutExtension(output) + "." + RAW_ASTC_EXTENSION;
+		return output;
 	}
 
 	private static function isPNGAsset(asset:Asset, destination:String):Bool
@@ -256,6 +378,24 @@ class ASTCTextureHelper
 		return project.config.getBool("android.astc-premultiply-alpha", true);
 	}
 
+	/**
+		Long asset paths can blow past the Windows MAX_PATH limit and make
+		low-level file operations throw. Treat any crash during compression
+		as a failed conversion so the caller falls back to the plain PNG.
+	**/
+	private static function tryCompressPNG(project:HXProject, input:String, output:String):Bool
+	{
+		try
+		{
+			return compressPNG(project, input, output);
+		}
+		catch (e:Dynamic)
+		{
+			Log.warn("ASTC conversion crashed: " + input + " (" + Std.string(e) + ")");
+			return false;
+		}
+	}
+
 	private static function getStrict(project:HXProject):Bool
 	{
 		return project.config.getBool("android.astc-strict", project.config.getBool("android.astc-strip-png", true));
@@ -284,6 +424,181 @@ class ASTCTextureHelper
 		return false;
 	}
 
+	private static function tryReuseRawASTCAsKTX(project:HXProject, input:String, rawOutput:String, finalOutput:String):Bool
+	{
+		if (finalOutput == rawOutput || !usesKTXContainer(project))
+			return false;
+		if (!FileSystem.exists(rawOutput))
+			return false;
+		if (!isReusableRawASTC(rawOutput))
+			return false;
+
+		try
+		{
+			var rawMetaPath = getMetaPath(rawOutput);
+			var rawMeta = FileSystem.exists(rawMetaPath) ? File.getContent(rawMetaPath) : null;
+			if (rawMeta != null)
+			{
+				if (System.isNewer(input, rawOutput) && !sourceMatchesRawMeta(input, rawMeta))
+					return false;
+
+				if (!StringTools.startsWith(rawMeta, getCacheHeader(project, input))
+					&& !hasMatchingSettings(project, rawMeta)
+					&& !tryUpgradeLegacyCache(project, input, rawOutput, rawMeta))
+					return false;
+
+				rawMeta = File.getContent(rawMetaPath);
+			}
+			else if (System.isNewer(input, rawOutput))
+			{
+				return false;
+			}
+
+			var blockSize = rawMeta != null ? getMetaValue(rawMeta, "block") : null;
+			if (blockSize == null || blockSize == "")
+				blockSize = getRawASTCBlockSize(rawOutput);
+			if (blockSize == null || blockSize == "")
+				blockSize = getBlockSize(project);
+
+			var hadOutput = FileSystem.exists(finalOutput) && isKTXFile(finalOutput);
+			var needsWrap = !hadOutput || System.isNewer(rawOutput, finalOutput) || System.isNewer(input, finalOutput);
+			if (needsWrap && !wrapASTCAsKTX(rawOutput, finalOutput))
+				return false;
+
+			saveMeta(getMetaPath(finalOutput), getMeta(project, input, blockSize));
+			if (needsWrap)
+			{
+				converted++;
+				Log.info("", " - \x1b[1mWriting ASTC texture:\x1b[0m " + finalOutput + " block=" + blockSize + " container=ktx cached");
+			}
+			else
+			{
+				skipped++;
+			}
+			return true;
+		}
+		catch (e:Dynamic)
+		{
+			return false;
+		}
+	}
+
+	private static function isReusableRawASTC(path:String):Bool
+	{
+		try
+		{
+			if (path == null || !FileSystem.exists(path))
+				return false;
+
+			var bytes = File.getBytes(path);
+			return bytes != null && bytes.length > ASTC_HEADER_SIZE && hasValidASTCHeader(bytes);
+		}
+		catch (e:Dynamic) {}
+
+		return false;
+	}
+
+	private static function sourceMatchesRawMeta(input:String, meta:String):Bool
+	{
+		try
+		{
+			var source = getMetaValue(meta, "source");
+			if (source == null || source == "")
+				return false;
+
+			var parts = source.split("|");
+			if (parts.length < 2)
+				return false;
+
+			var stat = FileSystem.stat(input);
+			if (Std.string(stat.size) != parts[1])
+				return false;
+
+			var inputPath = normalize(input);
+			var metaPath = normalize(parts[0]);
+			return inputPath == metaPath || StringTools.endsWith(inputPath, "/" + metaPath) || StringTools.endsWith(metaPath, "/" + inputPath);
+		}
+		catch (e:Dynamic) {}
+
+		return false;
+	}
+
+	private static function hasMatchingSettings(project:HXProject, meta:String):Bool
+	{
+		if (meta == null || meta == "")
+			return false;
+
+		var expected = getSettingsSignature(project);
+		var expectedWithoutContainer = removeSettingPart(expected, "container=");
+		for (line in meta.split("\n"))
+		{
+			if (!StringTools.startsWith(line, "settings="))
+				continue;
+
+			var settings = line.substr("settings=".length);
+			if (settings == expected || removeSettingPart(settings, "container=") == expectedWithoutContainer)
+				return true;
+		}
+
+		return false;
+	}
+
+	private static function removeSettingPart(settings:String, prefix:String):String
+	{
+		if (settings == null || settings == "")
+			return settings;
+
+		var parts = [];
+		for (part in settings.split("|"))
+		{
+			if (!StringTools.startsWith(part, prefix))
+				parts.push(part);
+		}
+
+		return parts.join("|");
+	}
+
+	private static function getRawASTCBlockSize(path:String):String
+	{
+		try
+		{
+			var bytes = File.getBytes(path);
+			if (bytes != null && bytes.length > ASTC_HEADER_SIZE && hasValidASTCHeader(bytes))
+				return bytes.get(4) + "x" + bytes.get(5);
+		}
+		catch (e:Dynamic) {}
+
+		return null;
+	}
+
+	private static function isKTXFile(path:String):Bool
+	{
+		try
+		{
+			if (path == null || !FileSystem.exists(path))
+				return false;
+
+			var bytes = File.getBytes(path);
+			return bytes != null
+				&& bytes.length > KTX_HEADER_SIZE
+				&& bytes.get(0) == 0xAB
+				&& bytes.get(1) == 0x4B
+				&& bytes.get(2) == 0x54
+				&& bytes.get(3) == 0x58
+				&& bytes.get(4) == 0x20
+				&& bytes.get(5) == 0x31
+				&& bytes.get(6) == 0x31
+				&& bytes.get(7) == 0xBB
+				&& bytes.get(8) == 0x0D
+				&& bytes.get(9) == 0x0A
+				&& bytes.get(10) == 0x1A
+				&& bytes.get(11) == 0x0A;
+		}
+		catch (e:Dynamic) {}
+
+		return false;
+	}
+
 	private static function tryUpgradeLegacyCache(project:HXProject, input:String, output:String, cachedMeta:String):Bool
 	{
 		if (cachedMeta == null || cachedMeta == "" || System.isNewer(input, output))
@@ -296,7 +611,7 @@ class ASTCTextureHelper
 		if (cachedMeta != getLegacyMeta(project, blockSize))
 			return false;
 
-		File.saveContent(getMetaPath(output), getMeta(project, input, blockSize));
+		saveMeta(getMetaPath(output), getMeta(project, input, blockSize));
 		return true;
 	}
 
@@ -348,6 +663,7 @@ class ASTCTextureHelper
 			"block=" + getBlockSize(project),
 			"quality=" + getQuality(project),
 			"colorprofile=" + getColorProfile(project),
+			"container=" + getTextureExtension(project),
 			"premultiplyAlpha=" + getPremultiplyAlpha(project),
 			"smartBlocks=" + getSmartBlocks(project),
 			"detailBlock=" + getDetailBlockSize(project),
@@ -379,6 +695,23 @@ class ASTCTextureHelper
 	private static function getMetaPath(output:String):String
 	{
 		return output + ".meta";
+	}
+
+	/**
+		Meta files are only build-cache sidecars; a failed write (for example
+		when the path exceeds the Windows MAX_PATH limit) must not abort the
+		build. The texture simply won't be cached and gets recompressed next time.
+	**/
+	private static function saveMeta(path:String, meta:String):Void
+	{
+		try
+		{
+			File.saveContent(path, meta);
+		}
+		catch (e:Dynamic)
+		{
+			Log.warn("Could not write ASTC meta file (cache disabled for this texture): " + path);
+		}
 	}
 
 	private static function sanitize(value:String, fallback:String):String
@@ -550,6 +883,117 @@ class ASTCTextureHelper
 			return detailBlock;
 
 		return baseBlock;
+	}
+
+	private static function wrapASTCAsKTX(rawASTC:String, output:String):Bool
+	{
+		try
+		{
+			if (rawASTC == null || output == null || !FileSystem.exists(rawASTC))
+				return false;
+
+			var rawBytes = File.getBytes(rawASTC);
+			if (rawBytes == null || rawBytes.length <= ASTC_HEADER_SIZE || !hasValidASTCHeader(rawBytes))
+			{
+				Log.warn("ASTC KTX container failed; invalid ASTC source: " + rawASTC);
+				return false;
+			}
+
+			var blockX = rawBytes.get(4);
+			var blockY = rawBytes.get(5);
+			var blockZ = rawBytes.get(6);
+			var width = readU24(rawBytes, 7);
+			var height = readU24(rawBytes, 10);
+			var depth = readU24(rawBytes, 13);
+			var internalFormat = getASTCInternalFormat(blockX, blockY);
+			if (blockZ != 1 || depth != 1 || width <= 0 || height <= 0 || internalFormat == 0)
+			{
+				Log.warn("ASTC KTX container failed; unsupported ASTC source: " + rawASTC);
+				return false;
+			}
+
+			var payloadLength = rawBytes.length - ASTC_HEADER_SIZE;
+			var padding = (4 - (payloadLength % 4)) % 4;
+			var ktx = Bytes.alloc(KTX_HEADER_SIZE + 4 + payloadLength + padding);
+			writeKTXIdentifier(ktx);
+			var offset = 12;
+			offset = writeU32LE(ktx, offset, 0x04030201); // endianness
+			offset = writeU32LE(ktx, offset, 0); // glType
+			offset = writeU32LE(ktx, offset, 1); // glTypeSize
+			offset = writeU32LE(ktx, offset, 0); // glFormat
+			offset = writeU32LE(ktx, offset, internalFormat);
+			offset = writeU32LE(ktx, offset, 0x1908); // GL_RGBA
+			offset = writeU32LE(ktx, offset, width);
+			offset = writeU32LE(ktx, offset, height);
+			offset = writeU32LE(ktx, offset, 0); // pixelDepth
+			offset = writeU32LE(ktx, offset, 0); // array elements
+			offset = writeU32LE(ktx, offset, 1); // faces
+			offset = writeU32LE(ktx, offset, 1); // mip levels
+			offset = writeU32LE(ktx, offset, 0); // key/value bytes
+			writeU32LE(ktx, KTX_HEADER_SIZE, payloadLength);
+			ktx.blit(KTX_HEADER_SIZE + 4, rawBytes, ASTC_HEADER_SIZE, payloadLength);
+
+			System.mkdir(Path.directory(output));
+			if (FileSystem.exists(output))
+				FileSystem.deleteFile(output);
+			File.saveBytes(output, ktx);
+			return FileSystem.exists(output);
+		}
+		catch (e:Dynamic)
+		{
+			Log.warn("ASTC KTX container failed: " + rawASTC + " (" + e + ")");
+			return false;
+		}
+	}
+
+	private static inline function hasValidASTCHeader(bytes:Bytes):Bool
+	{
+		return bytes.get(0) == 0x13
+			&& bytes.get(1) == 0xAB
+			&& bytes.get(2) == 0xA1
+			&& bytes.get(3) == 0x5C;
+	}
+
+	private static inline function readU24(bytes:Bytes, offset:Int):Int
+	{
+		return bytes.get(offset) | (bytes.get(offset + 1) << 8) | (bytes.get(offset + 2) << 16);
+	}
+
+	private static function getASTCInternalFormat(blockX:Int, blockY:Int):Int
+	{
+		return switch ('$blockX' + 'x' + '$blockY') {
+			case "4x4": 0x93B0;
+			case "5x4": 0x93B1;
+			case "5x5": 0x93B2;
+			case "6x5": 0x93B3;
+			case "6x6": 0x93B4;
+			case "8x5": 0x93B5;
+			case "8x6": 0x93B6;
+			case "8x8": 0x93B7;
+			case "10x5": 0x93B8;
+			case "10x6": 0x93B9;
+			case "10x8": 0x93BA;
+			case "10x10": 0x93BB;
+			case "12x10": 0x93BC;
+			case "12x12": 0x93BD;
+			default: 0;
+		}
+	}
+
+	private static function writeKTXIdentifier(bytes:Bytes):Void
+	{
+		var id = [0xAB, 0x4B, 0x54, 0x58, 0x20, 0x31, 0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A];
+		for (i in 0...id.length)
+			bytes.set(i, id[i]);
+	}
+
+	private static inline function writeU32LE(bytes:Bytes, offset:Int, value:Int):Int
+	{
+		bytes.set(offset, value & 0xFF);
+		bytes.set(offset + 1, (value >> 8) & 0xFF);
+		bytes.set(offset + 2, (value >> 16) & 0xFF);
+		bytes.set(offset + 3, (value >> 24) & 0xFF);
+		return offset + 4;
 	}
 
 	private static function compressWithAstcenc(project:HXProject, encoder:String, input:String, output:String, blockSize:String):Bool
