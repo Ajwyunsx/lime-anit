@@ -236,6 +236,9 @@ class AndroidPlatform extends PlatformTarget
 			var checked = 0;
 			var verbose = project.config.getBool("android.astc-clean-verbose", false);
 
+			removed += cleanReadablePNGCompressedOutputs(sourceSet, destination, verbose);
+			removed += cleanLegacyRawASTCForKTXOutputs(sourceSet, destination, verbose);
+
 			for (asset in ASTCTextureHelper.getStrippedPNGAssets())
 			{
 				if (asset == null || asset.resourceName == null || asset.resourceName == "")
@@ -277,6 +280,26 @@ class AndroidPlatform extends PlatformTarget
 					Log.error("Stripped asset is still present in ASTC Android output: " + path);
 
 				removed++;
+
+				if (project.config.getBool("android.astc-ktx", true))
+				{
+					var legacyASTCPath = Path.standardize(Path.withoutExtension(path) + ".astc");
+					if (!Path.startsWith(legacyASTCPath, root))
+						Log.error("Refusing to clean legacy ASTC output outside root: " + legacyASTCPath);
+					if (FileSystem.exists(legacyASTCPath))
+					{
+						try
+						{
+							FileSystem.deleteFile(legacyASTCPath);
+							removed++;
+						}
+						catch (e:Dynamic)
+						{
+							Log.error("Legacy ASTC asset is still present in Android output: " + legacyASTCPath);
+						}
+					}
+				}
+
 				cleanEmptyDirectories(Path.directory(path), root);
 			}
 
@@ -286,6 +309,8 @@ class AndroidPlatform extends PlatformTarget
 
 		var roots:Array<String> = [sourceSet + "/assets"];
 		var packRoots:Map<String, Bool> = [];
+		var removed = cleanReadablePNGCompressedOutputs(sourceSet, destination, project.config.getBool("android.astc-clean-verbose", false));
+		removed += cleanLegacyRawASTCForKTXOutputs(sourceSet, destination, project.config.getBool("android.astc-clean-verbose", false));
 
 		for (asset in project.assets)
 		{
@@ -295,8 +320,6 @@ class AndroidPlatform extends PlatformTarget
 				roots.push(destination + "/" + asset.deliveryPackName + "/src/main/assets");
 			}
 		}
-
-		var removed = 0;
 
 		function recurse(root:String, directory:String):Void
 		{
@@ -361,11 +384,130 @@ class AndroidPlatform extends PlatformTarget
 		Log.info("", " - \x1b[1mChecked ASTC Android stripped outputs:\x1b[0m " + removed + " removed");
 	}
 
+	private function cleanLegacyRawASTCForKTXOutputs(sourceSet:String, destination:String, verbose:Bool):Int
+	{
+		if (!project.config.getBool("android.astc-ktx", true))
+			return 0;
+
+		var roots:Array<String> = [sourceSet + "/assets"];
+		var packRoots:Map<String, Bool> = [];
+		var removed = 0;
+
+		for (asset in project.assets)
+		{
+			if (asset != null && asset.deliveryPackName != null && asset.deliveryPackName != "" && !packRoots.exists(asset.deliveryPackName))
+			{
+				packRoots.set(asset.deliveryPackName, true);
+				roots.push(destination + "/" + asset.deliveryPackName + "/src/main/assets");
+			}
+		}
+
+		function recurse(root:String, directory:String):Void
+		{
+			if (!FileSystem.exists(directory) || !FileSystem.isDirectory(directory))
+				return;
+
+			for (entry in FileSystem.readDirectory(directory))
+			{
+				var path = Path.standardize(Path.combine(directory, entry));
+				if (!Path.startsWith(path, root))
+					Log.error("Refusing to clean legacy ASTC output outside root: " + path);
+
+				if (FileSystem.isDirectory(path))
+				{
+					recurse(root, path);
+				}
+				else if (StringTools.endsWith(path.toLowerCase(), ".astc") && FileSystem.exists(path + ".ktx"))
+				{
+					if (verbose)
+						Log.info("", " - \x1b[1mRemoving legacy raw ASTC beside KTX output:\x1b[0m " + path);
+
+					try
+					{
+						FileSystem.deleteFile(path);
+						removed++;
+					}
+					catch (e:Dynamic)
+					{
+						Log.error("Legacy ASTC asset is still present in Android output: " + path);
+					}
+				}
+			}
+		}
+
+		for (root in roots)
+		{
+			root = Path.standardize(root);
+			recurse(root, root);
+		}
+
+		return removed;
+	}
+
+	private function cleanReadablePNGCompressedOutputs(sourceSet:String, destination:String, verbose:Bool):Int
+	{
+		var removed = 0;
+
+		for (asset in ASTCTextureHelper.getReadablePNGAssets())
+		{
+			if (asset == null || asset.resourceName == null || asset.resourceName == "")
+				continue;
+
+			var root = asset.deliveryPackName != null && asset.deliveryPackName != ""
+				? destination + "/" + asset.deliveryPackName + "/src/main/assets"
+				: sourceSet + "/assets";
+			root = Path.standardize(root);
+
+			var pngPath = Path.standardize(Path.combine(root, asset.resourceName));
+			if (!Path.startsWith(pngPath, root))
+				Log.error("Refusing to clean readable PNG compressed output outside root: " + pngPath);
+
+			var compressedPaths = [
+				Path.standardize(Path.withoutExtension(pngPath) + ".astc"),
+				Path.standardize(Path.withoutExtension(pngPath) + ".astc.ktx")
+			];
+
+			for (path in compressedPaths)
+			{
+				if (!Path.startsWith(path, root))
+					Log.error("Refusing to clean readable PNG compressed output outside root: " + path);
+
+				if (cleanedASTCOutputPaths.exists(path))
+					continue;
+				cleanedASTCOutputPaths.set(path, true);
+
+				if (!FileSystem.exists(path))
+					continue;
+
+				if (verbose)
+					Log.info("", " - \x1b[1mRemoving readable PNG compressed duplicate:\x1b[0m " + path);
+
+				try
+				{
+					FileSystem.deleteFile(path);
+				}
+				catch (e:Dynamic)
+				{
+					Log.error("Readable PNG compressed duplicate is still present in Android output: " + path);
+				}
+
+				if (FileSystem.exists(path))
+					Log.error("Readable PNG compressed duplicate is still present in Android output: " + path);
+
+				removed++;
+				cleanEmptyDirectories(Path.directory(path), root);
+			}
+		}
+
+		return removed;
+	}
+
 	private function isASTCStrippedOutputExtension(extension:String):Bool
 	{
 		return switch (extension)
 		{
 			case "png", "png~", "kra", "kra~", "psd", "psb", "clip", "xcf": true;
+			case "astc": project.config.getBool("android.astc-ktx", true);
 			default: false;
 		}
 	}
@@ -377,7 +519,39 @@ class AndroidPlatform extends PlatformTarget
 			return false;
 		}
 
+		if (isASTCReadablePNGAsset(asset))
+		{
+			return false;
+		}
+
 		return isASTCStrippedOutputExtension(Path.extension(asset.resourceName).toLowerCase());
+	}
+
+	private function isASTCReadablePNGAsset(asset:Asset):Bool
+	{
+		if (asset == null)
+			return false;
+
+		for (readable in ASTCTextureHelper.getReadablePNGAssets())
+		{
+			if (readable == null)
+				continue;
+			if (sameASTCAssetPath(readable.resourceName, asset.resourceName)
+				|| sameASTCAssetPath(readable.targetPath, asset.targetPath)
+				|| sameASTCAssetPath(readable.sourcePath, asset.sourcePath))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private function sameASTCAssetPath(a:String, b:String):Bool
+	{
+		if (a == null || b == null || a == "" || b == "")
+			return false;
+		return Path.standardize(a).toLowerCase() == Path.standardize(b).toLowerCase();
 	}
 
 	private function shouldReuseAndroidAssetOutput():Bool
@@ -419,8 +593,55 @@ class AndroidPlatform extends PlatformTarget
 			return false;
 		}
 
+		if (cachedAndroidOutputNeedsKTXRefresh(sourceSet + "/assets", haxeDirectory))
+		{
+			Log.warn("ANDROID_REUSE_ASSETS requested but cached Android output still uses raw .astc textures; running normal asset update to generate .astc.ktx.");
+			return false;
+		}
+
 		Log.info("", " - \x1b[1mReusing Android assets/project output:\x1b[0m ANDROID_REUSE_ASSETS enabled");
 		return true;
+	}
+
+	private function cachedAndroidOutputNeedsKTXRefresh(assetsDirectory:String, haxeDirectory:String):Bool
+	{
+		if (containsFileEnding(assetsDirectory, ".astc"))
+			return true;
+
+		if (containsFileEnding(assetsDirectory, ".astc.ktx"))
+			return false;
+
+		var manifestResources = Path.combine(haxeDirectory, "ManifestResources.hx");
+		if (FileSystem.exists(manifestResources))
+		{
+			var content = File.getContent(manifestResources);
+			if (content.indexOf(".astc") != -1 && content.indexOf(".astc.ktx") == -1)
+				return true;
+		}
+
+		return false;
+	}
+
+	private function containsFileEnding(directory:String, ending:String):Bool
+	{
+		if (directory == null || directory == "" || !FileSystem.exists(directory) || !FileSystem.isDirectory(directory))
+			return false;
+
+		for (entry in FileSystem.readDirectory(directory))
+		{
+			var path = Path.combine(directory, entry);
+			if (FileSystem.isDirectory(path))
+			{
+				if (containsFileEnding(path, ending))
+					return true;
+			}
+			else if (StringTools.endsWith(Path.standardize(path).toLowerCase(), ending))
+			{
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	private function isReuseAndroidAssetsEnabled():Bool
