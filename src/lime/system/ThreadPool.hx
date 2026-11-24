@@ -176,6 +176,8 @@ class ThreadPool extends WorkOutput
 	**/
 	public var workPriority(default, set):Float = 1;
 
+	public var canceled(default, null):Bool = false;
+
 	@:deprecated("Instead pass the callback to ThreadPool.run().")
 	@:noCompletion @:dox(hide) public var doWork(get, never):PseudoEvent;
 
@@ -241,6 +243,7 @@ class ThreadPool extends WorkOutput
 			throw "Call cancel() only from the main thread.";
 		}
 
+		canceled = true;
 		Application.current.onUpdate.remove(__update);
 
 		// Cancel active jobs, leaving `minThreads` idle threads.
@@ -343,6 +346,7 @@ class ThreadPool extends WorkOutput
 			throw "Call run() only from the main thread.";
 		}
 
+		canceled = false;
 		if (doWork == null)
 		{
 			if (__doWork == null)
